@@ -1,0 +1,78 @@
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const { isReviewCandidate, scoreCase, validateGroundTruth } = require('./eval-score.js');
+
+let checks = 0;
+function check(name, fn) {
+  try { fn(); checks++; console.log(`PASS  US-D9: ${name}`); }
+  catch (error) { console.error(`FAIL  US-D9: ${name}\n${error.stack}`); process.exitCode = 1; }
+}
+
+const quad = [[0, 0], [10, 0], [10, 10], [0, 10]];
+check('expectFallback 正当失败记录 fallback 成功但不产生 IoU 样本', () => {
+  const result = scoreCase({ quad, expectFallback: true }, null, () => 0.2);
+  assert.deepStrictEqual(result, { label: '✓降级', fallbackOk: true, fallback: true, falsePositive: false });
+  assert.strictEqual(Object.hasOwn(result, 'iou'), false);
+});
+check('expectFallback 硬检出进入误检但不产生 IoU 样本', () => {
+  const result = scoreCase({ quad, expectFallback: true }, quad, () => 1);
+  assert.deepStrictEqual(result, { label: '误检', fallbackOk: false, fallback: true, falsePositive: true });
+  assert.strictEqual(Object.hasOwn(result, 'iou'), false);
+});
+check('普通 quad 继续沿用 IoU 计分', () => {
+  const detected = scoreCase({ quad }, quad, () => 0.82);
+  const missed = scoreCase({ quad }, null, () => 1);
+  assert.strictEqual(detected.iou, 0.82); assert.strictEqual(detected.iouPass, true);
+  assert.deepStrictEqual(missed, { label: 'null', fallback: false, falsePositive: false });
+});
+check('noTarget 与 expectFallback 被 schema 明确区分', () => {
+  assert.throws(() => validateGroundTruth('bad.png', { noTarget: true, expectFallback: true }), /mutually exclusive/);
+  assert.doesNotThrow(() => validateGroundTruth('fallback.png', { quad, expectFallback: true }));
+});
+check('候选队列只筛普通低分/漏检，不替用户重判既有语义', () => {
+  assert.strictEqual(isReviewCandidate({ quad }, scoreCase({ quad }, null, () => 1)), true);
+  assert.strictEqual(isReviewCandidate({ quad }, scoreCase({ quad }, quad, () => 0.69)), true);
+  assert.strictEqual(isReviewCandidate({ quad, expectFallback: true }, scoreCase({ quad, expectFallback: true }, null, () => 0)), false);
+  assert.strictEqual(isReviewCandidate({ noTarget: true }, scoreCase({ noTarget: true }, null, () => 0)), false);
+});
+
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'open-lens-fallback-e2e-'));
+try {
+  const gtFile = path.join(scratch, 'ground-truth.json');
+  fs.writeFileSync(gtFile, JSON.stringify({ 'A.png': { mode: 'screen', quad }, 'B.png': { mode: 'screen', noTarget: true } }, null, 2));
+  const command = path.join(__dirname, 'mark-expect-fallback.js');
+  const dryRun = spawnSync(process.execPath, [command, scratch, '--set', 'A'], { encoding: 'utf8' });
+  check('批量指认默认 dry-run 不写 GT', () => {
+    assert.strictEqual(dryRun.status, 0); assert.strictEqual(JSON.parse(fs.readFileSync(gtFile))['A.png'].expectFallback, undefined);
+  });
+  const applied = spawnSync(process.execPath, [command, scratch, '--set', 'A', '--apply'], { encoding: 'utf8' });
+  check('显式 apply 写标记且自动保留快照', () => {
+    assert.strictEqual(applied.status, 0);
+    assert.strictEqual(JSON.parse(fs.readFileSync(gtFile))['A.png'].expectFallback, true);
+    assert.strictEqual(fs.readdirSync(path.join(scratch, '.gt-snapshots')).length, 1);
+  });
+  const invalid = spawnSync(process.execPath, [command, scratch, '--set', 'B', '--apply'], { encoding: 'utf8' });
+  check('noTarget 不能被误标为 expectFallback', () => assert.notStrictEqual(invalid.status, 0));
+  fs.copyFileSync(path.join(__dirname, 'photos/02-perspective-whiteboard.png'), path.join(scratch, 'A.png'));
+  const evaluated = spawnSync(process.execPath, [path.join(__dirname, 'eval-run.js'), scratch], { encoding: 'utf8', timeout: 30000 });
+  check('eval-run 汇总显示总样本、fallback 剔除数、成功率与误检列', () => {
+    assert.strictEqual(evaluated.status, 0, evaluated.stderr);
+    assert.match(evaluated.stdout, /总样本=1 mIoU=n\/a mIoU样本=0 expectFallback剔除=1 IoU≥0\.7: 0\/0 expectFallback=\d\/1 误检=/);
+  });
+  const reviewGt = JSON.parse(fs.readFileSync(gtFile));
+  delete reviewGt['A.png'].expectFallback;
+  fs.writeFileSync(gtFile, JSON.stringify(reviewGt, null, 2));
+  const reviewed = spawnSync(process.execPath, [path.join(__dirname, 'eval-run.js'), scratch, '--mode', 'screen', '--review-candidates'], { encoding: 'utf8', timeout: 30000 });
+  check('eval-run 生成只读低分候选 desktop 复审 URL', () => {
+    assert.strictEqual(reviewed.status, 0, reviewed.stderr);
+    assert.match(reviewed.stdout, /reviewCandidates\(screen null or IoU<0\.70\)=1/);
+    assert.match(reviewed.stdout, /reviewUrl=http:\/\/127\.0\.0\.1:8791\/#review=A/);
+  });
+} finally {
+  fs.rmSync(scratch, { recursive: true, force: true });
+}
+
+console.log(process.exitCode ? `TEST DONE (FAILED/${checks + 1})` : `TEST DONE (${checks}/${checks} PASS)`);

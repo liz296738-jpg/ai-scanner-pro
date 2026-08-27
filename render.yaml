@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: open-lens
+    runtime: static
+    rootDir: app
+    buildCommand: sh -c "mkdir -p /opt/render/project/src/.render-opencv-src && curl -fsSL -o .render-opencv-src/opencv.js https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js && cp .render-opencv-src/opencv.js public/opencv.js && rm -rf .render-opencv-src && npx bun install --production=false --no-save vite && npx bun run build && rm -rf public/opencv.js node_modules dist/assets/*.js"
+    publishPath: dist
+    envVars:
+      - key: VITE_PUBLIC_PATH
+        value: /
