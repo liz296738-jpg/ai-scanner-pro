@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check": "vue-tsc --noEmit"
+    "check": "vue-tsc --noEmit",
+    "postinstall-restore": "bun ../scripts/postinstall-restore.mjs"
   },
   "keywords": [],
   "author": "",
